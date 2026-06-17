@@ -46,4 +46,18 @@ size_t cbm_mem_worker_budget(int num_workers);
 /* Return unused pages to the OS. Call between files to bound per-file peak. */
 void cbm_mem_collect(void);
 
+/* Install async-signal-safe handlers for SIGTERM/SIGXCPU/SIGUSR2 that write a
+ * single "mem.oom" line (rss_mb / vsz_mb / files_done) to stderr before
+ * re-raising. The kernel can't catch SIGKILL, but on FreeBSD an `ulimit -v`
+ * overflow surfaces as SIGSEGV/SIGBUS and resource limits as SIGXCPU — we race
+ * a final diagnostic line out before the process dies.
+ *
+ * The caller updates the in-flight progress counter via cbm_mem_set_progress();
+ * the handler reads it atomically. No-op on Windows. Idempotent. */
+void cbm_mem_install_oom_logger(void);
+
+/* Update the "files done" counter the OOM logger reports. Called by the
+ * parallel-extract progress path. */
+void cbm_mem_set_progress(int files_done, int file_count);
+
 #endif /* CBM_MEM_H */

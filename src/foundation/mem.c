@@ -26,14 +26,18 @@
 #include <psapi.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#include <signal.h>
+#include <unistd.h>
 #elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
 #include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
+#include <signal.h>
 #include <unistd.h>
 #else
 #include <sys/resource.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -295,4 +299,105 @@ size_t cbm_mem_worker_budget(int num_workers) {
 
 void cbm_mem_collect(void) {
     mi_collect(true);
+}
+
+/* ── OOM-imminent signal handler ───────────────────────────────── */
+
+static atomic_int g_files_done;
+static atomic_int g_file_count;
+static atomic_int g_oom_logger_installed;
+
+void cbm_mem_set_progress(int files_done, int file_count) {
+    atomic_store_explicit(&g_files_done, files_done, memory_order_relaxed);
+    atomic_store_explicit(&g_file_count, file_count, memory_order_relaxed);
+}
+
+#ifndef _WIN32
+
+/* Async-signal-safe decimal writer. Writes the integer to fd, NUL-free. */
+static void as_write_u64(int fd, unsigned long long v) {
+    char b[32];
+    int i = (int)sizeof(b);
+    if (v == 0) {
+        b[--i] = '0';
+    } else {
+        while (v > 0 && i > 0) {
+            b[--i] = (char)('0' + (int)(v % 10));
+            v /= 10;
+        }
+    }
+    /* Write may return short or EINTR; for a SIGKILL-imminent handler the
+     * cost of a partial line is worth the simplicity. */
+    (void)!write(fd, &b[i], (size_t)((int)sizeof(b) - i));
+}
+
+static void as_write_str(int fd, const char *s) {
+    size_t n = 0;
+    while (s[n] != '\0') {
+        n++;
+    }
+    (void)!write(fd, s, n);
+}
+
+/* Emit "level=error msg=mem.oom signal=<sig> rss_mb=... vsz_mb=... files_done=.../...\n"
+ * to stderr. Uses only async-signal-safe primitives. */
+static void oom_logger_handler(int sig) {
+    /* mi_process_info is NOT in the POSIX async-signal-safe list, but in
+     * practice it just reads counters; we accept the residual risk because
+     * the alternative is no diagnostic at all. */
+    size_t rss = 0;
+    mi_process_info(NULL, NULL, NULL, &rss, NULL, NULL, NULL, NULL);
+    if (rss == 0) {
+        rss = os_rss();
+    }
+    size_t vsz = os_vsz();
+    int done = atomic_load_explicit(&g_files_done, memory_order_relaxed);
+    int total = atomic_load_explicit(&g_file_count, memory_order_relaxed);
+
+    as_write_str(2, "level=error msg=mem.oom signal=");
+    as_write_u64(2, (unsigned long long)sig);
+    as_write_str(2, " rss_mb=");
+    as_write_u64(2, (unsigned long long)(rss / MB_DIVISOR));
+    as_write_str(2, " vsz_mb=");
+    as_write_u64(2, (unsigned long long)(vsz / MB_DIVISOR));
+    as_write_str(2, " files_done=");
+    as_write_u64(2, (unsigned long long)done);
+    as_write_str(2, "/");
+    as_write_u64(2, (unsigned long long)total);
+    as_write_str(2, "\n");
+
+    /* Re-raise with the default disposition so the original termination path
+     * (core dump on SIGSEGV/SIGBUS, etc.) still runs. */
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+#endif /* !_WIN32 */
+
+void cbm_mem_install_oom_logger(void) {
+#ifdef _WIN32
+    /* TODO: SetUnhandledExceptionFilter when the Windows OOM path matters. */
+    return;
+#else
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_oom_logger_installed, &expected, 1)) {
+        return;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = oom_logger_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND; /* one-shot; re-raise will use SIG_DFL */
+    /* SIGTERM: graceful kill (`kill <pid>`, `ulimit -t` overrun on some Unixes).
+     * SIGXCPU: CPU time limit (`ulimit -t`) — typically arrives before SIGKILL.
+     * SIGSEGV/SIGBUS: FreeBSD signals these on `ulimit -v` address-space exhaust.
+     * SIGUSR2: explicit "give me a snapshot" hook for operators. */
+    sigaction(SIGTERM, &sa, NULL);
+#ifdef SIGXCPU
+    sigaction(SIGXCPU, &sa, NULL);
+#endif
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+#endif
 }

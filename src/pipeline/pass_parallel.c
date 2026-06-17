@@ -31,6 +31,12 @@ enum {
      * itself is near budget (then proceed with a soft overshoot). */
     PP_BACKPRESSURE_MAX_SPINS = 40,
     PP_BACKPRESSURE_NAP_NS = 3000000, /* 3 ms */
+    /* High-water memory log: emit one "parallel.mem.high_water" line every
+     * PP_HWM_PCT_STRIDE percent of extraction progress, so an operator can see
+     * the RSS/VSZ trajectory and back-pressure-vs-actual budget pressure
+     * without having to grep through every progress line. */
+    PP_HWM_PCT_TOTAL = 100,
+    PP_HWM_PCT_STRIDE = 5,
 };
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
@@ -656,6 +662,22 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if ((sort_pos + SKIP_ONE) % PP_LOG_INTERVAL == 0 || sort_pos + SKIP_ONE == ec->file_count) {
             cbm_log_info("parallel.extract.progress", "done", itoa_log(sort_pos + SKIP_ONE),
                          "total", itoa_log(ec->file_count));
+            cbm_mem_set_progress(sort_pos + SKIP_ONE, ec->file_count);
+        }
+
+        /* High-water memory log every ~5% so we can see RSS/VSZ trends in the
+         * field. Only logged from the worker that crosses each 5% boundary, so
+         * total volume is ~20 lines per pipeline. */
+        {
+            int prev_pct = (sort_pos * PP_HWM_PCT_TOTAL) / ec->file_count;
+            int curr_pct = ((sort_pos + SKIP_ONE) * PP_HWM_PCT_TOTAL) / ec->file_count;
+            if (curr_pct > prev_pct && (curr_pct % PP_HWM_PCT_STRIDE) == 0) {
+                size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
+                cbm_log_info("parallel.mem.high_water", "pct", itoa_log(curr_pct), "rss_mb",
+                             itoa_log((int)(cbm_mem_rss() / mb)), "vsz_mb",
+                             itoa_log((int)(cbm_mem_vsz() / mb)), "budget_mb",
+                             itoa_log((int)(cbm_mem_budget() / mb)));
+            }
         }
 
         /* Reclaim all slab + tier2 memory between files.
@@ -716,6 +738,11 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
+
+    /* Install best-effort OOM-imminent signal handler before extraction begins.
+     * Idempotent — re-extracting on the same process re-arms once. */
+    cbm_mem_install_oom_logger();
+    cbm_mem_set_progress(0, file_count);
 
     /* Log per-worker memory budget */
     if (cbm_mem_budget() > 0) {
