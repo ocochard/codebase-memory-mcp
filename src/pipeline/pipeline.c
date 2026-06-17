@@ -433,6 +433,59 @@ static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file
     }
 }
 
+/* Compact a post-resolve CBMFileResult into a slim shell holding only the
+ * fields the infra passes still need (string_refs + infra_bindings). String
+ * pointers + the items arrays are deep-copied into `tail_arena`, which is
+ * shared across all files and destroyed in one shot after the infra passes.
+ * The shell's own arena is initialized so cbm_free_result() on it is safe
+ * (it owns no live data — that's all in tail_arena). */
+static const char *tail_strdup(CBMArena *a, const char *s) {
+    return s ? cbm_arena_strdup(a, s) : NULL;
+}
+
+static CBMFileResult *compact_post_resolve(const CBMFileResult *orig, CBMArena *tail_arena) {
+    CBMFileResult *slim = calloc(1, sizeof(*slim));
+    if (!slim) {
+        return NULL;
+    }
+    cbm_arena_init(&slim->arena);
+
+    int src_n = orig->string_refs.count;
+    if (src_n > 0) {
+        CBMStringRef *items = cbm_arena_alloc(tail_arena, (size_t)src_n * sizeof(*items));
+        if (items) {
+            for (int i = 0; i < src_n; i++) {
+                const CBMStringRef *s = &orig->string_refs.items[i];
+                items[i].value = tail_strdup(tail_arena, s->value);
+                items[i].enclosing_func_qn = tail_strdup(tail_arena, s->enclosing_func_qn);
+                items[i].key_path = tail_strdup(tail_arena, s->key_path);
+                items[i].kind = s->kind;
+            }
+            slim->string_refs.items = items;
+            slim->string_refs.count = src_n;
+            slim->string_refs.cap = src_n;
+        }
+    }
+
+    int ib_n = orig->infra_bindings.count;
+    if (ib_n > 0) {
+        CBMInfraBinding *items = cbm_arena_alloc(tail_arena, (size_t)ib_n * sizeof(*items));
+        if (items) {
+            for (int i = 0; i < ib_n; i++) {
+                const CBMInfraBinding *b = &orig->infra_bindings.items[i];
+                items[i].source_name = tail_strdup(tail_arena, b->source_name);
+                items[i].target_url = tail_strdup(tail_arena, b->target_url);
+                items[i].broker = tail_strdup(tail_arena, b->broker);
+            }
+            slim->infra_bindings.items = items;
+            slim->infra_bindings.count = ib_n;
+            slim->infra_bindings.cap = ib_n;
+        }
+    }
+
+    return slim;
+}
+
 static bool is_infra_file(const char *fp) {
     return fp != NULL &&
            (strstr(fp, ".yaml") != NULL || strstr(fp, ".yml") != NULL ||
@@ -714,6 +767,28 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(def_modules);
     }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+
+    /* Post-resolve compaction. The two infra passes below only read
+     * string_refs and infra_bindings from each CBMFileResult; every other
+     * field (defs/calls/imports/usages/throws/rw/env_accesses/impl_traits/
+     * resolved_calls/channels/retained-source/cached_tree) is dead at this
+     * point. On 76k-file repos those heavy per-file arenas were the dominant
+     * remaining contributor to peak RSS after the arena-block-size fix —
+     * compact each entry into a slim shell backed by a single shared tail
+     * arena, then free the heavy originals before running the infra passes.
+     * Total post-resolve memory drops from O(76k * avg_arena_kb) to roughly
+     * O(76k * sizeof(slim_shell) + tail_arena_for_url_strings_only). */
+    CBMArena tail_arena;
+    cbm_arena_init(&tail_arena);
+    for (int i = 0; i < file_count; i++) {
+        if (cache[i]) {
+            CBMFileResult *slim = compact_post_resolve(cache[i], &tail_arena);
+            cbm_free_result(cache[i]);
+            cache[i] = slim;
+        }
+    }
+    log_phase_mem("post_resolve_compact");
+
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
@@ -721,6 +796,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             cbm_free_result(cache[i]);
         }
     }
+    cbm_arena_destroy(&tail_arena);
     free(cache);
     if (rc != 0) {
         return rc;
