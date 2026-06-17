@@ -8,7 +8,11 @@
 // supported — this is by design for per-file extraction where all data has the
 // same lifetime.
 #define CBM_ARENA_MAX_BLOCKS 256
-#define CBM_ARENA_DEFAULT_BLOCK_SIZE (64 * 1024) // 64KB initial
+// Initial block size kept in sync with src/foundation/arena.h. The legacy
+// arena.c in this directory is no longer linked into the production binary —
+// src/foundation/arena.c is the one that actually runs — but the constant is
+// kept consistent here to avoid confusion if a developer reads this header.
+#define CBM_ARENA_DEFAULT_BLOCK_SIZE (4 * 1024) // 4 KB (one page)
 
 typedef struct {
     char *blocks[CBM_ARENA_MAX_BLOCKS];

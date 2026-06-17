@@ -15,7 +15,13 @@
 #include <stdarg.h>
 
 #define CBM_ARENA_MAX_BLOCKS 256
-#define CBM_ARENA_DEFAULT_BLOCK_SIZE ((size_t)64 * 1024) /* 64KB */
+/* Initial block size for per-file CBMFileResult arenas. The arena doubles on
+ * overflow (see arena.c:arena_grow), so substantial files reach the same final
+ * size regardless of the starting block; the 4 KB initial keeps fixed overhead
+ * tiny for the long tail of small/sparse files. At 64 KB × 76k files = ~5 GB of
+ * mostly-empty blocks were the single largest contributor to the indexing OOM
+ * on repos the size of FreeBSD src/ or the Linux kernel. */
+#define CBM_ARENA_DEFAULT_BLOCK_SIZE ((size_t)4 * 1024) /* 4 KB (one page) */
 
 typedef struct {
     char *blocks[CBM_ARENA_MAX_BLOCKS];
