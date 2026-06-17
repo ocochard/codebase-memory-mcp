@@ -226,6 +226,17 @@ void cbm_mem_init(double ram_fraction) {
     mi_option_set(mi_option_purge_decommits, SKIP_ONE);
     mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
 
+    /* Large/huge OS pages imply eager commit (per the mimalloc docs at the
+     * option definition) — disable them so a single faulted byte does not
+     * commit a 2 MiB page worth of RSS. */
+    mi_option_set(mi_option_allow_large_os_pages, 0);
+
+    /* Note on arena_reserve: we tried capping it from 1 GiB → 64 MiB to
+     * reduce VSZ overhead, but on FreeBSD it made things strictly worse
+     * (5%→25% extract grew VSZ from 28→45 GB vs. 29→33 GB at default).
+     * The 1 GiB default amortizes across worker threads; smaller arenas
+     * just trigger more reservations. Left at default. */
+
     cbm_system_info_t info = cbm_system_info();
     g_budget = (size_t)((double)info.total_ram * ram_fraction);
 
