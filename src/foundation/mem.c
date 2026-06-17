@@ -26,7 +26,14 @@
 #include <psapi.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#include <sys/param.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <unistd.h>
 #else
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -39,6 +46,22 @@ static atomic_int g_was_over;    /* pressure hysteresis */
 #define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
 
 /* ── OS fallback for RSS (ASan builds where MI_OVERRIDE=0) ──── */
+
+/* BSD: read kinfo_proc for this PID via sysctl. ki_rssize is in pages,
+ * ki_size is the VM map total in bytes. */
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+static int bsd_kinfo(struct kinfo_proc *kp) {
+#if defined(__OpenBSD__)
+    int mib[6] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid(), sizeof(*kp), 1};
+    size_t len = sizeof(*kp);
+    return sysctl(mib, 6, kp, &len, NULL, 0);
+#else
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    size_t len = sizeof(*kp);
+    return sysctl(mib, 4, kp, &len, NULL, 0);
+#endif
+}
+#endif
 
 static size_t os_rss(void) {
 #ifdef _WIN32
@@ -55,6 +78,18 @@ static size_t os_rss(void) {
         return (size_t)info.resident_size;
     }
     return 0;
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    struct kinfo_proc kp;
+    if (bsd_kinfo(&kp) != 0) {
+        return 0;
+    }
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t pgsz = ps > 0 ? (size_t)ps : CBM_SZ_4K;
+#if defined(__OpenBSD__)
+    return (size_t)kp.p_vm_rssize * pgsz;
+#else
+    return (size_t)kp.ki_rssize * pgsz;
+#endif
 #else
     FILE *f = fopen("/proc/self/statm", "r");
     if (!f) {
@@ -68,6 +103,70 @@ static size_t os_rss(void) {
     (void)fclose(f);
     long ps = sysconf(_SC_PAGESIZE);
     return rss_pages * (ps > 0 ? (size_t)ps : CBM_SZ_4K);
+#endif
+}
+
+static size_t os_vsz(void) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+        return (size_t)pmc.PrivateUsage;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    struct mach_task_basic_info info = {0};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) ==
+        KERN_SUCCESS) {
+        return (size_t)info.virtual_size;
+    }
+    return 0;
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    struct kinfo_proc kp;
+    if (bsd_kinfo(&kp) != 0) {
+        return 0;
+    }
+#if defined(__OpenBSD__)
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t pgsz = ps > 0 ? (size_t)ps : CBM_SZ_4K;
+    /* OpenBSD's kinfo_proc tracks VSZ in pages across text/data/stack. */
+    return ((size_t)kp.p_vm_tsize + (size_t)kp.p_vm_dsize + (size_t)kp.p_vm_ssize) * pgsz;
+#else
+    return (size_t)kp.ki_size;
+#endif
+#else
+    /* Linux: /proc/self/statm column 1 is total VM in pages. */
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) {
+        return 0;
+    }
+    unsigned long pages = 0;
+    if (fscanf(f, "%lu", &pages) != 1) {
+        pages = 0;
+    }
+    (void)fclose(f);
+    long ps = sysconf(_SC_PAGESIZE);
+    return pages * (ps > 0 ? (size_t)ps : CBM_SZ_4K);
+#endif
+}
+
+/* Address-space ceiling derived from RLIMIT_AS (if set) or 0 when unlimited.
+ * The kernel SIGKILLs the process when VSZ crosses this — we want to bail out
+ * cleanly somewhat before then. */
+static size_t os_addr_space_limit(void) {
+#ifdef _WIN32
+    /* Windows has no direct RLIMIT_AS equivalent in the standard API surface;
+     * commit charge is the practical ceiling and is reported via VSZ already. */
+    return 0;
+#else
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_AS, &rl) != 0) {
+        return 0;
+    }
+    if (rl.rlim_cur == RLIM_INFINITY) {
+        return 0;
+    }
+    return (size_t)rl.rlim_cur;
 #endif
 }
 
@@ -154,14 +253,37 @@ size_t cbm_mem_peak_rss(void) {
     return os_rss();
 }
 
+size_t cbm_mem_vsz(void) {
+    return os_vsz();
+}
+
 size_t cbm_mem_budget(void) {
     return g_budget;
+}
+
+/* VSZ ceiling = min(budget * 1.5, RLIMIT_AS * 0.9).
+ * The 1.5x factor over the RSS budget tolerates mimalloc's lazy-commit
+ * VSZ overhead in normal operation. The 0.9 RLIMIT_AS multiplier leaves
+ * headroom so we trip our own back-pressure before the kernel SIGKILLs us
+ * on `ulimit -v`. */
+static size_t vsz_ceiling(void) {
+    size_t soft = g_budget + g_budget / 2; /* budget * 1.5 */
+    size_t hard = os_addr_space_limit();
+    if (hard == 0) {
+        return soft;
+    }
+    size_t hard90 = hard - (hard / 10); /* hard * 0.9 */
+    return soft < hard90 ? soft : hard90;
 }
 
 bool cbm_mem_over_budget(void) {
     size_t rss = cbm_mem_rss();
     check_pressure(rss);
-    return rss > g_budget;
+    if (rss > g_budget) {
+        return true;
+    }
+    size_t vsz = cbm_mem_vsz();
+    return vsz > 0 && vsz > vsz_ceiling();
 }
 
 size_t cbm_mem_worker_budget(int num_workers) {
